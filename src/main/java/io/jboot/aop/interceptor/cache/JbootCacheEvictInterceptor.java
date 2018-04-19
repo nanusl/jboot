@@ -1,11 +1,11 @@
 /**
- * Copyright (c) 2015-2017, Michael Yang 杨福海 (fuhai999@gmail.com).
+ * Copyright (c) 2015-2018, Michael Yang 杨福海 (fuhai999@gmail.com).
  * <p>
- * Licensed under the GNU Lesser General Public License (LGPL) ,Version 3.0 (the "License");
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  * <p>
- * http://www.gnu.org/licenses/lgpl-3.0.txt
+ * http://www.apache.org/licenses/LICENSE-2.0
  * <p>
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -42,12 +42,8 @@ public class JbootCacheEvictInterceptor implements MethodInterceptor {
         }
 
         String unlessString = cacheEvict.unless();
-        if (StringUtils.isNotBlank(unlessString)) {
-            unlessString = String.format("#(%s)", unlessString);
-            String unlessBoolString = Kits.engineRender(unlessString, method, methodInvocation.getArguments());
-            if ("true".equals(unlessBoolString)) {
-                return methodInvocation.proceed();
-            }
+        if (Kits.isUnless(unlessString, method, methodInvocation.getArguments())) {
+            return methodInvocation.proceed();
         }
 
 
@@ -55,8 +51,12 @@ public class JbootCacheEvictInterceptor implements MethodInterceptor {
         JbootAssert.assertTrue(StringUtils.isNotBlank(cacheName),
                 String.format("CacheEvict.name()  must not empty in method [%s]!!!", targetClass.getName() + "#" + method.getName()));
 
-        String cacheKey = Kits.buildCacheKey(cacheEvict.key(), targetClass, method, methodInvocation.getArguments());
+        if ("*".equals(cacheEvict.key())) {
+            Jboot.me().getCache().removeAll(cacheName);
+            return methodInvocation.proceed();
+        }
 
+        String cacheKey = Kits.buildCacheKey(cacheEvict.key(), targetClass, method, methodInvocation.getArguments());
         Jboot.me().getCache().remove(cacheName, cacheKey);
         return methodInvocation.proceed();
     }

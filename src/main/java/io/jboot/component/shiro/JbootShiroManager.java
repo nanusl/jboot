@@ -1,11 +1,11 @@
 /**
- * Copyright (c) 2015-2017, Michael Yang 杨福海 (fuhai999@gmail.com).
+ * Copyright (c) 2015-2018, Michael Yang 杨福海 (fuhai999@gmail.com).
  * <p>
- * Licensed under the GNU Lesser General Public License (LGPL) ,Version 3.0 (the "License");
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  * <p>
- * http://www.gnu.org/licenses/lgpl-3.0.txt
+ * http://www.apache.org/licenses/LICENSE-2.0
  * <p>
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -16,15 +16,18 @@
 package io.jboot.component.shiro;
 
 import com.jfinal.config.Routes;
-import com.jfinal.core.ActionKey;
 import com.jfinal.core.Controller;
+import io.jboot.Jboot;
 import io.jboot.component.shiro.processer.*;
+import io.jboot.exception.JbootIllegalConfigException;
 import io.jboot.utils.ArrayUtils;
+import io.jboot.utils.ClassKits;
+import io.jboot.utils.StringUtils;
+import io.jboot.web.utils.ControllerUtils;
 import org.apache.shiro.authz.annotation.*;
 
 import java.lang.annotation.Annotation;
 import java.lang.reflect.Method;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -35,6 +38,8 @@ import java.util.concurrent.ConcurrentHashMap;
 public class JbootShiroManager {
     private static JbootShiroManager me = new JbootShiroManager();
 
+    private JbootShiroConfig jbootShiroConfig = Jboot.config(JbootShiroConfig.class);
+
     private JbootShiroManager() {
     }
 
@@ -43,7 +48,6 @@ public class JbootShiroManager {
         return me;
     }
 
-    private static final String SLASH = "/";
     private ConcurrentHashMap<String, ShiroAuthorizeProcesserInvoker> invokers = new ConcurrentHashMap<>();
 
     private ShiroRequiresAuthenticationProcesser requiresAuthenticationProcesser = new ShiroRequiresAuthenticationProcesser();
@@ -59,7 +63,7 @@ public class JbootShiroManager {
      * 初始化 invokers 变量
      */
     private void initInvokers(List<Routes.Route> routes) {
-        Set<String> excludedMethodName = buildExcludedMethodName();
+        Set<String> excludedMethodName = ControllerUtils.buildExcludedMethodName();
 
         for (Routes.Route route : routes) {
             Class<? extends Controller> controllerClass = route.getControllerClass();
@@ -70,7 +74,7 @@ public class JbootShiroManager {
 
             Method[] methods = controllerClass.getMethods();
             for (Method method : methods) {
-                if (excludedMethodName.contains(method.getName()) || method.getParameterTypes().length != 0) {
+                if (excludedMethodName.contains(method.getName())) {
                     continue;
                 }
 
@@ -83,7 +87,7 @@ public class JbootShiroManager {
                 Annotation[] allAnnotations = ArrayUtils.concat(controllerAnnotations, methodAnnotations);
 
 
-                String actionKey = createActionKey(controllerClass, method, controllerKey);
+                String actionKey = ControllerUtils.createActionKey(controllerClass, method, controllerKey);
                 ShiroAuthorizeProcesserInvoker invoker = new ShiroAuthorizeProcesserInvoker();
 
 
@@ -112,47 +116,6 @@ public class JbootShiroManager {
     }
 
 
-    /**
-     * 参考ActionMapping中的实现。
-     *
-     * @param controllerClass
-     * @param method
-     * @param controllerKey
-     * @return
-     */
-
-    private String createActionKey(Class<? extends Controller> controllerClass,
-                                   Method method, String controllerKey) {
-        String methodName = method.getName();
-        String actionKey;
-
-        ActionKey ak = method.getAnnotation(ActionKey.class);
-        if (ak != null) {
-            actionKey = ak.value().trim();
-            if ("".equals(actionKey))
-                throw new IllegalArgumentException(controllerClass.getName() + "." + methodName + "(): The argument of ActionKey can not be blank.");
-            if (!actionKey.startsWith(SLASH))
-                actionKey = SLASH + actionKey;
-        } else if (methodName.equals("index")) {
-            actionKey = controllerKey;
-        } else {
-            actionKey = controllerKey.equals(SLASH) ? SLASH + methodName : controllerKey + SLASH + methodName;
-        }
-        return actionKey;
-    }
-
-
-    private Set<String> buildExcludedMethodName() {
-        Set<String> excludedMethodName = new HashSet<String>();
-        Method[] methods = Controller.class.getMethods();
-        for (Method m : methods) {
-            if (m.getParameterTypes().length == 0)
-                excludedMethodName.add(m.getName());
-        }
-        return excludedMethodName;
-    }
-
-
     public AuthorizeResult invoke(String actionKey) {
         ShiroAuthorizeProcesserInvoker invoker = invokers.get(actionKey);
         if (invoker == null) {
@@ -162,5 +125,25 @@ public class JbootShiroManager {
         return invoker.invoke();
     }
 
+    private JbootShiroInvokeListener invokeListener;
+
+    public JbootShiroInvokeListener getInvokeListener() {
+
+        if (invokeListener != null) {
+            return invokeListener;
+        }
+
+        invokeListener = JbootShiroInvokeListener.DEFAULT;
+
+        if (StringUtils.isNotBlank(jbootShiroConfig.getInvokeListener())) {
+            invokeListener = ClassKits.newInstance(jbootShiroConfig.getInvokeListener());
+            if (invokeListener == null) {
+                throw new JbootIllegalConfigException("can not find Class : " + jbootShiroConfig.getInvokeListener() +
+                        " please config jboot.shiro.invokeListener correct. ");
+            }
+        }
+
+        return invokeListener;
+    }
 
 }

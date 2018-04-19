@@ -1,11 +1,11 @@
 /**
- * Copyright (c) 2015-2017, Michael Yang 杨福海 (fuhai999@gmail.com).
+ * Copyright (c) 2015-2018, Michael Yang 杨福海 (fuhai999@gmail.com).
  * <p>
- * Licensed under the GNU Lesser General Public License (LGPL) ,Version 3.0 (the "License");
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  * <p>
- * http://www.gnu.org/licenses/lgpl-3.0.txt
+ * http://www.apache.org/licenses/LICENSE-2.0
  * <p>
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,15 +15,19 @@
  */
 package io.jboot.component.redis;
 
-import io.jboot.config.annotation.PropertieConfig;
+import io.jboot.config.annotation.PropertyConfig;
 import io.jboot.utils.StringUtils;
 import redis.clients.jedis.HostAndPort;
 
 import java.util.HashSet;
 import java.util.Set;
 
-@PropertieConfig(prefix = "jboot.redis")
+@PropertyConfig(prefix = "jboot.redis")
 public class JbootRedisConfig {
+
+    public static final String TYPE_JEDIS = "jedis";
+    public static final String TYPE_REDISSON = "redisson";
+    public static final String TYPE_LETTUCE = "lettuce";
 
     private String host;
     private Integer port = 6379;
@@ -38,8 +42,8 @@ public class JbootRedisConfig {
     private Long minEvictableIdleTimeMillis;
     private Long timeBetweenEvictionRunsMillis;
     private Integer numTestsPerEvictionRun;
-    private String channel;
     private Integer maxAttempts;
+    private String type = TYPE_JEDIS;
 
 
     public String getHost() {
@@ -146,14 +150,6 @@ public class JbootRedisConfig {
         this.numTestsPerEvictionRun = numTestsPerEvictionRun;
     }
 
-    public String getChannel() {
-        return channel;
-    }
-
-    public void setChannel(String channel) {
-        this.channel = channel;
-    }
-
     public Integer getMaxAttempts() {
         return maxAttempts;
     }
@@ -172,6 +168,14 @@ public class JbootRedisConfig {
 
     public boolean isClusterConfig() {
         return isConfigOk() && host.contains(",");
+    }
+
+    public String getType() {
+        return type;
+    }
+
+    public void setType(String type) {
+        this.type = type;
     }
 
     public Set<HostAndPort> getHostAndPorts() {

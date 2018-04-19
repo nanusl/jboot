@@ -1,11 +1,11 @@
 /**
- * Copyright (c) 2015-2017, Michael Yang 杨福海 (fuhai999@gmail.com).
+ * Copyright (c) 2015-2018, Michael Yang 杨福海 (fuhai999@gmail.com).
  * <p>
- * Licensed under the GNU Lesser General Public License (LGPL) ,Version 3.0 (the "License");
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  * <p>
- * http://www.gnu.org/licenses/lgpl-3.0.txt
+ * http://www.apache.org/licenses/LICENSE-2.0
  * <p>
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -21,6 +21,7 @@ import com.jfinal.plugin.ehcache.IDataLoader;
 import io.jboot.Jboot;
 import io.jboot.core.cache.annotation.Cacheable;
 import io.jboot.exception.JbootAssert;
+import io.jboot.exception.JbootException;
 import io.jboot.utils.StringUtils;
 import org.aopalliance.intercept.MethodInterceptor;
 import org.aopalliance.intercept.MethodInvocation;
@@ -47,14 +48,9 @@ public class JbootCacheInterceptor implements MethodInterceptor {
         }
 
         String unlessString = cacheable.unless();
-        if (StringUtils.isNotBlank(unlessString)) {
-            unlessString = String.format("#(%s)", unlessString);
-            String unlessBoolString = Kits.engineRender(unlessString, method, methodInvocation.getArguments());
-            if ("true".equals(unlessBoolString)) {
-                return methodInvocation.proceed();
-            }
+        if (Kits.isUnless(unlessString, method, methodInvocation.getArguments())) {
+            return methodInvocation.proceed();
         }
-
 
         String cacheName = cacheable.name();
         JbootAssert.assertTrue(StringUtils.isNotBlank(cacheName),
@@ -62,25 +58,32 @@ public class JbootCacheInterceptor implements MethodInterceptor {
 
         String cacheKey = Kits.buildCacheKey(cacheable.key(), targetClass, method, methodInvocation.getArguments());
 
-
-        return Jboot.me().getCache().get(cacheName, cacheKey, new IDataLoader() {
+        IDataLoader dataLoader = new IDataLoader() {
             @Override
             public Object load() {
                 Object r = null;
                 try {
                     r = methodInvocation.proceed();
-                } catch (Throwable e) {
-                    LOG.error(e.toString(), e);
+                } catch (Throwable throwable) {
+                    if (throwable instanceof RuntimeException) {
+                        throw (RuntimeException) throwable;
+                    } else {
+                        throw new JbootException(throwable);
+                    }
                 }
-
                 if (r != null) {
                     return r;
                 }
 
-                return Cacheable.DEFAULT_NULL_VALUE.equals(cacheable.nullValue()) ? null : cacheable.nullValue();
+                return cacheable.nullCacheEnable() ? new NullObject() : null;
             }
-        });
+        };
 
+        Object data = cacheable.liveSeconds() > 0
+                ? Jboot.me().getCache().get(cacheName, cacheKey, dataLoader, cacheable.liveSeconds())
+                : Jboot.me().getCache().get(cacheName, cacheKey, dataLoader);
+
+        return data == null || data instanceof NullObject ? null : data;
     }
 
 

@@ -1,11 +1,11 @@
 /**
- * Copyright (c) 2015-2017, Michael Yang 杨福海 (fuhai999@gmail.com).
+ * Copyright (c) 2015-2018, Michael Yang 杨福海 (fuhai999@gmail.com).
  * <p>
- * Licensed under the GNU Lesser General Public License (LGPL) ,Version 3.0 (the "License");
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  * <p>
- * http://www.gnu.org/licenses/lgpl-3.0.txt
+ * http://www.apache.org/licenses/LICENSE-2.0
  * <p>
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -15,6 +15,7 @@
  */
 package io.jboot.db.model;
 
+import com.alibaba.fastjson.annotation.JSONField;
 import com.jfinal.core.JFinal;
 import com.jfinal.plugin.activerecord.Model;
 import com.jfinal.plugin.activerecord.Page;
@@ -22,10 +23,17 @@ import com.jfinal.plugin.activerecord.Table;
 import com.jfinal.plugin.activerecord.TableMapping;
 import com.jfinal.plugin.ehcache.IDataLoader;
 import io.jboot.Jboot;
+import io.jboot.component.hystrix.JbootHystrixCommand;
+import io.jboot.db.JbootDbHystrixFallbackListener;
+import io.jboot.db.JbootDbHystrixFallbackListenerDefault;
+import io.jboot.db.dialect.IJbootModelDialect;
 import io.jboot.exception.JbootAssert;
 import io.jboot.exception.JbootException;
 import io.jboot.utils.ArrayUtils;
+import io.jboot.utils.ClassKits;
 import io.jboot.utils.StringUtils;
+import io.shardingjdbc.core.api.HintManager;
+import io.shardingjdbc.core.hint.HintManagerHolder;
 
 import java.util.*;
 
@@ -33,13 +41,16 @@ import java.util.*;
 @SuppressWarnings("serial")
 public class JbootModel<M extends JbootModel<M>> extends Model<M> {
 
-    private static final String COLUMN_CREATED = "created";
-    private static final String COLUMN_MODIFIED = "modified";
+    public static final String AUTO_COPY_MODEL = "_auto_copy_model_";
+
+    private static final String COLUMN_CREATED = JbootModelConfig.getConfig().getColumnCreated();
+    private static final String COLUMN_MODIFIED = JbootModelConfig.getConfig().getColumnModified();
 
     /**
      * 是否启用自动缓存
      */
-    private boolean autoCache = true;
+    private boolean cacheEnable = JbootModelConfig.getConfig().isCacheEnable();
+    private int cacheTime = JbootModelConfig.getConfig().getCacheTime();
 
 
     /**
@@ -49,7 +60,7 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
      * @param value
      */
     public void putCache(Object key, Object value) {
-        Jboot.me().getCache().put(tableName(), key, value);
+        Jboot.me().getCache().put(getTableName(), key, value, cacheTime);
     }
 
     /**
@@ -60,7 +71,7 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
      * @return
      */
     public <T> T getCache(Object key) {
-        return Jboot.me().getCache().get(tableName(), key);
+        return Jboot.me().getCache().get(getTableName(), key);
     }
 
     /**
@@ -72,7 +83,7 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
      * @return
      */
     public <T> T getCache(Object key, IDataLoader dataloader) {
-        return Jboot.me().getCache().get(tableName(), key, dataloader);
+        return Jboot.me().getCache().get(getTableName(), key, dataloader, cacheTime);
     }
 
     /**
@@ -82,7 +93,7 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
      */
     public void removeCache(Object key) {
         if (key == null) return;
-        Jboot.me().getCache().remove(tableName(), key);
+        Jboot.me().getCache().remove(getTableName(), key);
     }
 
 
@@ -97,7 +108,35 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
         M m = null;
         try {
             m = (M) getUsefulClass().newInstance();
-            m._setAttrs(this._getAttrs());
+            m.put(_getAttrs());
+        } catch (Throwable e) {
+            e.printStackTrace();
+        }
+        return m;
+    }
+
+    /**
+     * 在 RPC 传输的时候，通过 Controller 传入到Service
+     * 不同的序列化方案 可能导致 getModifyFlag 并未设置，可能造成无法保存到数据库
+     * 因此需要 通过这个方法 拷贝数据库对于字段，然后再进行更新或保存
+     *
+     * @return
+     */
+    public M copyModel() {
+        M m = null;
+        try {
+            m = (M) getUsefulClass().newInstance();
+            Table table = TableMapping.me().getTable(getUsefulClass());
+            if (table == null) {
+                throw new JbootException("can't get table of " + getUsefulClass() + " , maybe config incorrect");
+            }
+            Set<String> attrKeys = table.getColumnTypeMap().keySet();
+            for (String attrKey : attrKeys) {
+                Object o = this.get(attrKey);
+                if (o != null) {
+                    m.set(attrKey, o);
+                }
+            }
         } catch (Throwable e) {
             e.printStackTrace();
         }
@@ -106,81 +145,59 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
 
 
     /**
-     * 可以再DAO中调用此方法使用proxy数据源进行连接数据库
-     * 例如：DAO.useProxy().findById("123")
-     * 注意：使用此方法，需要配置名称为 proxy 的数据源
+     * 修复 jfinal use 可能造成的线程安全问题
      *
+     * @param configName
      * @return
      */
-    public M useProxy() {
-        M proxy = get("__proxy__");
-        if (proxy != null) {
-            return proxy;
+    @Override
+    public M use(String configName) {
+        M m = this.get("__ds__" + configName);
+        if (m == null) {
+
+            m = this.copy()
+                    .cacheEnable(this.cacheEnable)
+                    .cacheTime(this.cacheTime)
+                    .useSuper(configName);
+
+            this.put("__ds__" + configName, m);
         }
-
-        proxy = copy().use("proxy").autoCache(this.autoCache);
-
-        if (proxy._getConfig() == null) {
-            proxy.use(null);
-        }
-
-        set("__proxy__", proxy);
-        return proxy;
+        return m;
     }
 
 
-    /**
-     * 同 useProxy
-     *
-     * @return
-     */
-    public M useSlave() {
-        M proxy = get("__slave__");
-        if (proxy != null) {
-            return proxy;
-        }
-
-        proxy = copy().use("slave").autoCache(this.autoCache);
-
-        if (proxy._getConfig() == null) {
-            proxy.use(null);
-        }
-
-        set("__slave__", proxy);
-        return proxy;
+    M useSuper(String configName) {
+        return super.use(configName);
     }
-
-    /**
-     * 同 useProxy
-     *
-     * @return
-     */
-    public M useMaster() {
-        M proxy = get("__master__");
-        if (proxy != null) {
-            return proxy;
-        }
-
-        proxy = copy().use("master").autoCache(this.autoCache);
-
-        if (proxy._getConfig() == null) {
-            proxy.use(null);
-        }
-
-        set("__master__", proxy);
-        return proxy;
-    }
-
 
     /**
      * 是否启用自动缓存
      *
-     * @param autoCache
+     * @param enable
      * @return
      */
-    public M autoCache(boolean autoCache) {
-        this.autoCache = autoCache;
+    public M cacheEnable(boolean enable) {
+        this.cacheEnable = enable;
         return (M) this;
+    }
+
+    public boolean cacheEnable() {
+        return cacheEnable;
+    }
+
+    /**
+     * 设置默认的缓存时间
+     *
+     * @param time 缓存时间，单位：秒
+     * @return
+     */
+    public M cacheTime(int time) {
+        this.cacheTime = time;
+        return (M) this;
+    }
+
+    public int cacheTime() {
+        return cacheTime;
     }
 
 
@@ -208,14 +225,41 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
         if (hasColumn(COLUMN_CREATED) && get(COLUMN_CREATED) == null) {
             set(COLUMN_CREATED, new Date());
         }
-        if (null == get(getPrimaryKey()) && String.class == getPrimaryType()) {
-            set(getPrimaryKey(), StringUtils.uuid());
+
+        boolean needInitPrimaryKey = (String.class == getPrimaryType() && null == get(getPrimaryKey()));
+
+        if (needInitPrimaryKey) {
+            set(getPrimaryKey(), generatePrimaryValue());
         }
-        boolean saved = super.save();
-        if (saved) {
-            Jboot.me().sendEvent(addAction(), this);
+
+        boolean saveSuccess = false;
+
+        Boolean autoCopyModel = get(AUTO_COPY_MODEL);
+        if (autoCopyModel != null && autoCopyModel == true) {
+            M copyModel = copyModel();
+            saveSuccess = copyModel.saveNormal();
+
+            if (saveSuccess && !needInitPrimaryKey) {
+                this.set(getPrimaryKey(), copyModel.get(getPrimaryKey()));
+            }
+        } else {
+            saveSuccess = this.saveNormal();
         }
-        return saved;
+
+        if (saveSuccess) {
+            Jboot.sendEvent(addAction(), this);
+        }
+        return saveSuccess;
+    }
+
+
+    protected boolean saveNormal() {
+        return super.save();
+    }
+
+
+    protected String generatePrimaryValue() {
+        return StringUtils.uuid();
     }
 
 
@@ -228,10 +272,10 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
     public boolean delete() {
         boolean deleted = super.delete();
         if (deleted) {
-            if (autoCache) {
+            if (cacheEnable) {
                 removeCache(get(getPrimaryKey()));
             }
-            Jboot.me().sendEvent(deleteAction(), this);
+            Jboot.sendEvent(deleteAction(), this);
         }
         return deleted;
     }
@@ -246,7 +290,7 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
     @Override
     public boolean deleteById(Object idValue) {
         JbootModel<?> model = findById(idValue);
-        return model.delete();
+        return model == null ? true : model.delete();
     }
 
 
@@ -257,36 +301,51 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
      */
     @Override
     public boolean update() {
-        Boolean fromCopier = getBoolean(ModelCopier.MODEL_FROM_COPIER);
-        if (fromCopier != null && fromCopier) {
-            keepCopier();
-        }
-
         if (hasColumn(COLUMN_MODIFIED)) {
             set(COLUMN_MODIFIED, new Date());
         }
 
-        boolean update = super.update();
-        if (update) {
+        Boolean autoCopyModel = get(AUTO_COPY_MODEL);
+        boolean updateSuccess = (autoCopyModel != null && autoCopyModel == true) ? copyModel().updateNormal() : this.updateNormal();
+        if (updateSuccess) {
             Object id = get(getPrimaryKey());
-            if (autoCache) {
+            if (cacheEnable) {
                 removeCache(id);
             }
-            Jboot.me().sendEvent(updateAction(), findById(id));
+            Jboot.sendEvent(updateAction(), findById(id));
         }
-        return update;
+        return updateSuccess;
     }
 
-    protected String addAction() {
-        return tableName() + ":add";
+
+    /**
+     * 更新，但是不发送Action通知
+     *
+     * @return
+     */
+    public boolean updateWithoutEvent() {
+        if (hasColumn(COLUMN_MODIFIED)) {
+            set(COLUMN_MODIFIED, new Date());
+        }
+
+        Boolean autoCopyModel = get(AUTO_COPY_MODEL);
+        return (autoCopyModel != null && autoCopyModel == true) ? copyModel().updateNormal() : this.updateNormal();
     }
 
-    protected String deleteAction() {
-        return tableName() + ":delete";
+    boolean updateNormal() {
+        return super.update();
     }
 
-    protected String updateAction() {
-        return tableName() + ":update";
+    public String addAction() {
+        return getTableName() + ":add";
+    }
+
+    public String deleteAction() {
+        return getTableName() + ":delete";
+    }
+
+    public String updateAction() {
+        return getTableName() + ":update";
     }
 
     /**
@@ -297,7 +356,7 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
      */
     @Override
     public M findById(final Object idValue) {
-        return autoCache ? getCache(idValue, new IDataLoader() {
+        return cacheEnable ? getCache(idValue, new IDataLoader() {
             @Override
             public Object load() {
                 return findByIdWithoutCache(idValue);
@@ -305,6 +364,15 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
         }) : findByIdWithoutCache(idValue);
     }
 
+
+    public M findByIdWithoutCache(Object idValue) {
+        return super.findById(idValue);
+    }
+
+
+    private IJbootModelDialect getDialect() {
+        return (IJbootModelDialect) _getConfig().getDialect();
+    }
 
     /**
      * 根据列名和值，查找1条数据
@@ -314,48 +382,49 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
      * @return
      */
     public M findFirstByColumn(String column, Object value) {
-        StringBuilder sqlBuilder = new StringBuilder("SELECT * FROM `");
-        sqlBuilder.append(tableName()).append("` WHERE `").append(column).append("`=?");
-
-        if (hasColumn(COLUMN_CREATED)) {
-            sqlBuilder.append(" ORDER BY created  DESC ");
-        }
-
-        sqlBuilder.append(" LIMIT 1");
-        return findFirst(sqlBuilder.toString(), value);
+        String sql = getDialect().forFindByColumns(getTableName(), "*", Columns.create(column, value).getList(), null, 1);
+        return findFirst(sql, value);
     }
 
+    /**
+     * 根据 列和值 查询1条数据
+     *
+     * @param column
+     * @return
+     */
+    public M findFirstByColumn(Column column) {
+        String sql = getDialect().forFindByColumns(getTableName(), "*", Columns.create(column).getList(), null, 1);
+        return findFirst(sql, column.getValue());
+    }
 
     /**
-     * 根据列名和值 查询第一条数据
+     * 根据 多列和值，查询1条数据
      *
      * @param columns
      * @return
      */
-    public M findFirstByColumns(Map<String, ?> columns) {
-        StringBuilder sqlBuilder = new StringBuilder("SELECT * FROM `" + tableName() + "` ");
+    public M findFirstByColumns(Columns columns) {
+        String sql = getDialect().forFindByColumns(getTableName(), "*", columns.getList(), null, 1);
         LinkedList<Object> params = new LinkedList<Object>();
-        if (ArrayUtils.isNotEmpty(columns)) {
-            sqlBuilder.append(" WHERE ");
-            buildSqlByMap(columns, sqlBuilder, params);
-        }
-        appendDefaultOrderBy(sqlBuilder);
-        sqlBuilder.append(" LIMIT 1");
-        return params.isEmpty() ? findFirst(sqlBuilder.toString()) : findFirst(sqlBuilder.toString(), params.toArray());
-    }
 
-    private void buildSqlByMap(Map<String, ?> columns, StringBuilder sqlBuilder, LinkedList<Object> params) {
-        int index = 0;
-        for (Map.Entry<String, ? extends Object> entry : columns.entrySet()) {
-            sqlBuilder.append(" `" + entry.getKey() + "` = ? ");
-            if (index != columns.size() - 1) {
-                sqlBuilder.append(" AND ");
+        if (ArrayUtils.isNotEmpty(columns.getList())) {
+            for (Column column : columns.getList()) {
+                params.add(column.getValue());
             }
-            params.add(entry.getValue());
-            index++;
         }
+        return findFirst(sql, params.toArray());
     }
 
+
+    /**
+     * 查找全部数据
+     *
+     * @return
+     */
+    public List<M> findAll() {
+        String sql = getDialect().forFindByColumns(getTableName(), "*", null, null, null);
+        return find(sql);
+    }
 
     /**
      * 根据列名和值 查询一个列表
@@ -366,16 +435,9 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
      * @return
      */
     public List<M> findListByColumn(String column, Object value, Integer count) {
-        StringBuilder sqlBuilder = new StringBuilder("SELECT * FROM `");
-        sqlBuilder.append(tableName()).append("` WHERE `").append(column).append("`=?");
-
-        if (hasColumn(COLUMN_CREATED)) {
-            sqlBuilder.append(" ORDER BY created DESC ");
-        }
-        if (count != null) {
-            sqlBuilder.append(" LIMIT ").append(count);
-        }
-        return find(sqlBuilder.toString(), value);
+        List<Column> columns = new ArrayList<>();
+        columns.add(Column.create(column, value));
+        return findListByColumns(columns, count);
     }
 
 
@@ -387,17 +449,7 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
      * @return
      */
     public List<M> findListByColumn(Column column, Integer count) {
-        StringBuilder sqlBuilder = new StringBuilder("SELECT * FROM `");
-        sqlBuilder.append(tableName()).append("` WHERE ").append(column.sql());
-
-        if (hasColumn(COLUMN_CREATED)) {
-            sqlBuilder.append(" ORDER BY created DESC ");
-        }
-        if (count != null) {
-            sqlBuilder.append(" LIMIT ").append(count);
-        }
-
-        return find(sqlBuilder.toString(), column.getValue());
+        return findListByColumns(Columns.create(column).getList(), count);
     }
 
 
@@ -422,147 +474,43 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
     }
 
 
-    public List<M> findListByColumns(List<Column> columnList, String orderBy, Integer count) {
-        StringBuilder sqlBuilder = new StringBuilder("SELECT * FROM `" + tableName() + "` ");
-        LinkedList<Object> params = new LinkedList<Object>();
-
-        if (ArrayUtils.isNotEmpty(columnList)) {
-            sqlBuilder.append(" WHERE ");
-            buildSqlByList(columnList, sqlBuilder, params);
-        }
-        if (StringUtils.isNotBlank(orderBy)) {
-            sqlBuilder.append(" ORDER BY ").append(orderBy);
-        } else {
-            appendDefaultOrderBy(sqlBuilder);
-        }
-        if (count != null) {
-            sqlBuilder.append(" LIMIT " + count);
-        }
-        return params.isEmpty() ? find(sqlBuilder.toString()) : find(sqlBuilder.toString(), params.toArray());
-    }
-
-
     public List<M> findListByColumns(Columns columns) {
-        return findListByColumns(columns.getCols());
+        return findListByColumns(columns.getList());
     }
 
     public List<M> findListByColumns(Columns columns, String orderBy) {
-        return findListByColumns(columns.getCols(), orderBy);
+        return findListByColumns(columns.getList(), orderBy);
     }
 
     public List<M> findListByColumns(Columns columns, Integer count) {
-        return findListByColumns(columns.getCols(), count);
+        return findListByColumns(columns.getList(), count);
     }
 
 
     public List<M> findListByColumns(Columns columns, String orderBy, Integer count) {
-        return findListByColumns(columns.getCols(), orderBy, count);
-    }
-
-    private void buildSqlByList(List<Column> columns, StringBuilder sqlBuilder, LinkedList<Object> params) {
-        int index = 0;
-        for (Column column : columns) {
-            sqlBuilder.append(column.sql());
-            if (index != columns.size() - 1) {
-                sqlBuilder.append(" AND ");
-            }
-            params.add(column.getValue());
-            index++;
-        }
-    }
-
-
-    public List<M> findListByColumns(Map<String, ?> columns) {
-        return findListByColumns(columns, null, null);
-    }
-
-    public List<M> findListByColumns(Map<String, ?> columns, Integer count) {
-        return findListByColumns(columns, null, count);
-    }
-
-    public List<M> findListByColumns(Map<String, ?> columns, String orderBy) {
-        return findListByColumns(columns, orderBy, null);
-    }
-
-
-    public List<M> findListByColumns(Map<String, ?> columns, String orderBy, Integer count) {
-        StringBuilder sqlBuilder = new StringBuilder("SELECT * FROM `" + tableName() + "` ");
-        LinkedList<Object> params = new LinkedList<Object>();
-
-        if (ArrayUtils.isNotEmpty(columns)) {
-            sqlBuilder.append(" WHERE ");
-            buildSqlByMap(columns, sqlBuilder, params);
-        }
-        if (StringUtils.isNotBlank(orderBy)) {
-            sqlBuilder.append(" ORDER BY ").append(orderBy);
-        } else {
-            appendDefaultOrderBy(sqlBuilder);
-        }
-        if (count != null) {
-            sqlBuilder.append(" LIMIT " + count);
-        }
-
-        return params.isEmpty() ? find(sqlBuilder.toString()) : find(sqlBuilder.toString(), params.toArray());
-    }
-
-
-    public M findByIdWithoutCache(Object idValue) {
-        return super.findById(idValue);
-    }
-
-    /**
-     * 根据where信息，分页查询数据
-     *
-     * @param pageNumber 页码
-     * @param pageSize   每页显示数量
-     * @param where
-     * @param paras
-     * @return
-     */
-    public Page<M> paginateByWhere(int pageNumber, int pageSize, String where, Object... paras) {
-        String sqlExceptSelect = "FROM `" + tableName() + "` WHERE " + where;
-        if (where.toLowerCase().indexOf(" order ") == -1 && hasColumn(COLUMN_CREATED)) {
-            sqlExceptSelect += " ORDER BY created DESC";
-        }
-        return paginate(pageNumber, pageSize, "SELECT * ", sqlExceptSelect, paras);
-    }
-
-    /**
-     * 根据列信息，分页查询
-     *
-     * @param pageNumber
-     * @param pageSize
-     * @param columns
-     * @return
-     */
-    public Page<M> paginateByColumns(int pageNumber, int pageSize, Map<String, Object> columns) {
-        return paginateByColumns(pageNumber, pageSize, columns, null);
+        return findListByColumns(columns.getList(), orderBy, count);
     }
 
 
     /**
-     * 根据多列信息，分页查询
+     * 根据列信心查询列表
      *
-     * @param pageNumber
-     * @param pageSize
      * @param columns
      * @param orderBy
+     * @param count
      * @return
      */
-    public Page<M> paginateByColumns(int pageNumber, int pageSize, Map<String, ?> columns, String orderBy) {
-        StringBuilder sqlBuilder = new StringBuilder(" FROM `" + tableName() + "` ");
+    public List<M> findListByColumns(List<Column> columns, String orderBy, Integer count) {
         LinkedList<Object> params = new LinkedList<Object>();
+
         if (ArrayUtils.isNotEmpty(columns)) {
-            sqlBuilder.append(" WHERE ");
-            buildSqlByMap(columns, sqlBuilder, params);
+            for (Column column : columns) {
+                params.add(column.getValue());
+            }
         }
-        if (StringUtils.isNotBlank(orderBy)) {
-            sqlBuilder.append(" ORDER BY ").append(orderBy);
-        } else {
-            appendDefaultOrderBy(sqlBuilder);
-        }
-        return params.isEmpty() ? paginate(pageNumber, pageSize, "SELECT * ", sqlBuilder.toString())
-                : paginate(pageNumber, pageSize, "SELECT * ", sqlBuilder.toString(), params.toArray());
+
+        String sql = getDialect().forFindByColumns(getTableName(), "*", columns, orderBy, count);
+        return params.isEmpty() ? find(sql) : find(sql, params.toArray());
     }
 
 
@@ -574,9 +522,44 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
      * @return
      */
     public Page<M> paginate(int pageNumber, int pageSize) {
-        StringBuilder sqlBuilder = new StringBuilder(" FROM `" + tableName() + "` ");
-        appendDefaultOrderBy(sqlBuilder);
-        return paginate(pageNumber, pageSize, "SELECT * ", sqlBuilder.toString());
+        return paginateByColumns(pageNumber, pageSize, null, null);
+    }
+
+    /**
+     * 分页查询数据
+     *
+     * @param pageNumber
+     * @param pageSize
+     * @return
+     */
+    public Page<M> paginate(int pageNumber, int pageSize, String orderBy) {
+        return paginateByColumns(pageNumber, pageSize, null, orderBy);
+    }
+
+
+    /**
+     * 根据某列信息，分页查询数据
+     *
+     * @param pageNumber
+     * @param pageSize
+     * @param column
+     * @return
+     */
+    public Page<M> paginateByColumn(int pageNumber, int pageSize, Column column) {
+        return paginateByColumns(pageNumber, pageSize, Columns.create(column).getList(), null);
+    }
+
+
+    /**
+     * 根据某列信息，分页查询数据
+     *
+     * @param pageNumber
+     * @param pageSize
+     * @param column
+     * @return
+     */
+    public Page<M> paginateByColumn(int pageNumber, int pageSize, Column column, String orderBy) {
+        return paginateByColumns(pageNumber, pageSize, Columns.create(column).getList(), orderBy);
     }
 
 
@@ -603,50 +586,44 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
      * @return
      */
     public Page<M> paginateByColumns(int pageNumber, int pageSize, List<Column> columns, String orderBy) {
-        StringBuilder sqlBuilder = new StringBuilder(" FROM `" + tableName() + "` ");
+        String selectPartSql = getDialect().forPaginateSelect("*");
+        String fromPartSql = getDialect().forPaginateFrom(getTableName(), columns, orderBy);
+
         LinkedList<Object> params = new LinkedList<Object>();
 
         if (ArrayUtils.isNotEmpty(columns)) {
-            sqlBuilder.append(" WHERE ");
-            buildSqlByList(columns, sqlBuilder, params);
-
+            for (Column column : columns) {
+                params.add(column.getValue());
+            }
         }
-
-        if (StringUtils.isNotBlank(orderBy)) {
-            sqlBuilder.append(" ORDER BY ").append(orderBy);
-        } else {
-            appendDefaultOrderBy(sqlBuilder);
-        }
-        return params.isEmpty() ? paginate(pageNumber, pageSize, "SELECT * ", sqlBuilder.toString())
-                : paginate(pageNumber, pageSize, "SELECT * ", sqlBuilder.toString(), params.toArray());
+        return params.isEmpty() ? paginate(pageNumber, pageSize, selectPartSql, fromPartSql)
+                : paginate(pageNumber, pageSize, selectPartSql, fromPartSql, params.toArray());
     }
 
 
-    public String cacheName() {
-        return tableName();
+    @JSONField(serialize = false)
+    protected String getTableName() {
+        return getTable().getName();
     }
 
+    private transient Table table;
 
-    private void appendDefaultOrderBy(StringBuilder sqlBuilder) {
-        if (hasColumn(COLUMN_CREATED)) {
-            sqlBuilder.append(" ORDER BY created DESC");
-        }
-    }
-
-    private Table table;
-
-    public String tableName() {
+    @JSONField(serialize = false)
+    protected Table getTable() {
         if (table == null) {
             table = TableMapping.me().getTable(getUsefulClass());
             if (table == null) {
-                throw new JbootException(String.format("table for class[%s] is null! \n maybe cannot connection to database，please check your propertie files.", getUsefulClass()));
+                throw new JbootException(String.format("table of class %s is null, maybe cannot connection to database or not use correct datasource, " +
+                        "please check your properties file or correct config @Table(datasourc=xxx) in class %s.", getUsefulClass().getName(), getUsefulClass().getName()));
             }
         }
-        return table.getName();
+        return table;
     }
 
-    private String primaryKey;
 
+    private transient String primaryKey;
+
+    @JSONField(serialize = false)
     protected String getPrimaryKey() {
         if (primaryKey != null) {
             return primaryKey;
@@ -660,15 +637,19 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
         return primaryKey;
     }
 
-    private Class<?> primaryType;
+    private transient Class<?> primaryType;
 
-    public Class<?> getPrimaryType() {
+
+    @JSONField(serialize = false)
+    protected Class<?> getPrimaryType() {
         if (primaryType == null) {
             primaryType = TableMapping.me().getTable(getUsefulClass()).getColumnType(getPrimaryKey());
         }
         return primaryType;
     }
 
+
+    @JSONField(serialize = false)
     protected String[] getPrimaryKeys() {
         Table t = TableMapping.me().getTable(getUsefulClass());
         if (t == null) {
@@ -677,8 +658,9 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
         return t.getPrimaryKey();
     }
 
+
     protected boolean hasColumn(String columnLabel) {
-        return TableMapping.me().getTable(getUsefulClass()).hasColumnLabel(columnLabel);
+        return getTable().hasColumnLabel(columnLabel);
     }
 
     // -----------------------------Override----------------------------
@@ -700,9 +682,54 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
 
     @Override
     public List<M> find(String sql, Object... paras) {
+
         debugPrintParas(paras);
-        return super.find(sql, paras);
+
+        if (!JbootModelConfig.getConfig().isHystrixEnable()) {
+            return super.find(sql, paras);
+        }
+
+        final HintManager hintManager = HintManagerHolder.get();
+
+        return Jboot.hystrix(new JbootHystrixCommand("sql:" + sql, JbootModelConfig.getConfig().getHystrixTimeout()) {
+            @Override
+            protected Object run() throws Exception {
+                try {
+                    HintManagerHolder.setHintManager(hintManager);
+                    return JbootModel.super.find(sql, paras);
+                } finally {
+                    HintManagerHolder.clear();
+                }
+            }
+
+            @Override
+            public Object getFallback() {
+                return getHystrixFallbackListener().onFallback(sql, paras, this, this.getExecutionException());
+            }
+
+        });
     }
+
+    private transient JbootDbHystrixFallbackListener fallbackListener = null;
+
+    @JSONField(serialize = false)
+    public JbootDbHystrixFallbackListener getHystrixFallbackListener() {
+
+        if (fallbackListener != null) {
+            return fallbackListener;
+        }
+
+        if (!StringUtils.isBlank(JbootModelConfig.getConfig().getHystrixFallbackListener())) {
+            fallbackListener = ClassKits.newInstance(JbootModelConfig.getConfig().getHystrixFallbackListener());
+        }
+
+        if (fallbackListener == null) {
+            fallbackListener = new JbootDbHystrixFallbackListenerDefault();
+        }
+
+        return fallbackListener;
+    }
+
 
     @Override
     public M findFirst(String sql, Object... paras) {
@@ -746,27 +773,6 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
         }
     }
 
-    public Map<String, Object> _getAttrsAsMap() {
-        return _getAttrs();
-    }
-
-    /**
-     * 通过调用 keepCopier ，才能把从modelCopier复制过来的数据保存到数据库
-     */
-    public void keepCopier() {
-        Table table = TableMapping.me().getTable(getUsefulClass());
-        if (table == null) {
-            throw new RuntimeException("can't get table of " + getUsefulClass() + " , maybe jboot install incorrect");
-        }
-        Map<String, Class<?>> map = table.getColumnTypeMap();
-        for (Map.Entry<String, Class<?>> entry : map.entrySet()) {
-            Object o = get(entry.getKey());
-            if (o != null) {
-                set(entry.getKey(), o);
-            }
-        }
-    }
-
 
     @Override
     public boolean equals(Object o) {
@@ -785,4 +791,5 @@ public class JbootModel<M extends JbootModel<M>> extends Model<M> {
 
         return id.equals(get(getPrimaryKey()));
     }
+
 }
